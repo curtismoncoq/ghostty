@@ -4,14 +4,79 @@ import SwiftUI
 import GhosttyKit
 
 /// Controller for the "quick" terminal.
-class QuickTerminalController: BaseTerminalController {
-    override var windowNibName: NSNib.Name? { "QuickTerminal" }
+class QuickTerminalController: BaseTerminalController, TabGroupCloseCoordinator.Controller {
+    override var windowNibName: NSNib.Name? {
+        Self.windowNibName(for: ghostty.config)
+    }
+
+    private struct WindowStyleSignature: Equatable {
+        let nibName: String
+        let decorationEnabled: Bool
+    }
+
+    private static func windowNibName(for config: Ghostty.Config) -> String {
+        guard config.quickTerminalDecoration else {
+            return "QuickTerminal"
+        }
+
+        switch config.quickTerminalTitlebarStyle {
+        case "native":
+            return "QuickTerminal"
+        case "hidden":
+            return "QuickTerminalHiddenTitlebar"
+        case "transparent":
+            return "QuickTerminalTransparentTitlebar"
+        case "tabs":
+#if compiler(>=6.2)
+            if #available(macOS 26.0, *) {
+                return "QuickTerminalTabsTitlebarTahoe"
+            } else {
+                return "QuickTerminalTabsTitlebarVentura"
+            }
+#else
+            return "QuickTerminalTabsTitlebarVentura"
+#endif
+        default:
+            return "QuickTerminal"
+        }
+    }
+
+    private static func windowStyleSignature(for config: Ghostty.Config) -> WindowStyleSignature {
+        WindowStyleSignature(
+            nibName: windowNibName(for: config),
+            decorationEnabled: config.quickTerminalDecoration
+        )
+    }
 
     /// The position for the quick terminal.
     let position: QuickTerminalPosition
 
     /// The current state of the quick terminal
     private(set) var visible: Bool = false
+
+    /// Track the most recently active quick terminal tab for toggling.
+    static weak var lastActiveController: QuickTerminalController? = nil
+
+    /// Returns true if the quick terminal window is effectively visible to the user.
+    var isEffectivelyVisible: Bool {
+        guard let window else { return false }
+        if let tabGroup = window.tabGroup, tabGroup.selectedWindow != window {
+            return false
+        }
+        return window.isVisible && window.alphaValue > 0.01 && !window.ignoresMouseEvents
+    }
+
+    /// Track frame changes to detect tab reorder events.
+    private var tabListenForFrame: Bool = false
+    private var tabWindowsHash: Int = 0
+
+    /// Quick terminals should only reserve a titlebar safe area when a visible
+    /// titlebar style is in use.
+    override var forceIgnoreSafeAreaTop: Bool {
+        let style = derivedConfig.quickTerminalTitlebarStyle
+        let isHiddenStyle = style == "hidden"
+        return !derivedConfig.quickTerminalDecoration || isHiddenStyle
+    }
 
     /// The previously running application when the terminal is shown. This is NEVER Ghostty.
     /// If this is set then when the quick terminal is animated out then we will restore this
@@ -29,22 +94,38 @@ class QuickTerminalController: BaseTerminalController {
 
     /// The configuration derived from the Ghostty config so we don't need to rely on references.
     private var derivedConfig: DerivedConfig
+
+    /// Base config to use when creating the initial surface for this controller.
+    private var baseSurfaceConfig: Ghostty.SurfaceConfiguration? = nil
+
+    /// Tracks the loaded window style so we can detect when a reload needs a new XIB.
+    private var loadedWindowStyleSignature: WindowStyleSignature? = nil
     
     /// Tracks if we're currently handling a manual resize to prevent recursion
     private var isHandlingResize: Bool = false
+
+    /// Used to prevent auto-hide during tab transitions.
+    private var autoHideSuppressionDeadline: TimeInterval = 0
 
     /// This is set to false by init if the window managed by this controller should not be restorable.
     /// For example, terminals executing custom scripts are not restorable.
     let restorable: Bool
     private var restorationState: QuickTerminalRestorableState?
+    private let animateOnLoad: Bool
+
+    // TabGroupCloseCoordinator.Controller
+    lazy private(set) var tabGroupCloseCoordinator = TabGroupCloseCoordinator()
 
     init(_ ghostty: Ghostty.App,
          position: QuickTerminalPosition = .top,
          baseConfig base: Ghostty.SurfaceConfiguration? = nil,
+         animateOnLoad: Bool = true,
          restorationState: QuickTerminalRestorableState? = nil,
     ) {
         self.position = position
         self.derivedConfig = DerivedConfig(ghostty.config)
+        self.baseSurfaceConfig = base
+        self.animateOnLoad = animateOnLoad
         // The window we manage is not restorable if we've specified a command
         // to execute. We do this because the restored window is meaningless at the
         // time of writing this: it'd just restore to a shell in the same directory
@@ -77,6 +158,31 @@ class QuickTerminalController: BaseTerminalController {
             object: nil)
         center.addObserver(
             self,
+            selector: #selector(onMoveTab),
+            name: .ghosttyMoveTab,
+            object: nil)
+        center.addObserver(
+            self,
+            selector: #selector(onGotoTab),
+            name: Ghostty.Notification.ghosttyGotoTab,
+            object: nil)
+        center.addObserver(
+            self,
+            selector: #selector(onCloseTab),
+            name: .ghosttyCloseTab,
+            object: nil)
+        center.addObserver(
+            self,
+            selector: #selector(onCloseOtherTabs),
+            name: .ghosttyCloseOtherTabs,
+            object: nil)
+        center.addObserver(
+            self,
+            selector: #selector(onCloseTabsOnTheRight),
+            name: .ghosttyCloseTabsOnTheRight,
+            object: nil)
+        center.addObserver(
+            self,
             selector: #selector(closeWindow(_:)),
             name: .ghosttyCloseWindow,
             object: nil
@@ -90,6 +196,11 @@ class QuickTerminalController: BaseTerminalController {
             self,
             selector: #selector(windowDidResize(_:)),
             name: NSWindow.didResizeNotification,
+            object: nil)
+        center.addObserver(
+            self,
+            selector: #selector(onFrameDidChange),
+            name: NSView.frameDidChangeNotification,
             object: nil)
     }
 
@@ -120,6 +231,15 @@ class QuickTerminalController: BaseTerminalController {
         // We disable this for better control
         window.isRestorable = false
 
+        loadedWindowStyleSignature = Self.windowStyleSignature(for: ghostty.config)
+
+        // Apply borderless style before sizing so we match the final frame.
+        if let qtWindow = window as? QuickTerminalWindow {
+            if !derivedConfig.quickTerminalDecoration {
+                qtWindow.applyBorderlessStyle()
+            }
+        }
+
         // Setup our configured appearance that we support.
         syncAppearance()
 
@@ -148,8 +268,10 @@ class QuickTerminalController: BaseTerminalController {
             qtWindow.initialFrame = nil
         }
 
-        // Animate the window in
-        animateIn()
+        if animateOnLoad {
+            // Animate the window in
+            animateIn()
+        }
     }
 
     // MARK: NSWindowDelegate
@@ -160,6 +282,18 @@ class QuickTerminalController: BaseTerminalController {
         // If we're not visible we don't care to run the logic below. It only
         // applies if we can be seen.
         guard visible else { return }
+
+        Self.lastActiveController = self
+
+        if let window, window.alphaValue != 1 || window.ignoresMouseEvents {
+            window.alphaValue = 1
+            window.ignoresMouseEvents = false
+        }
+
+        relabelTabs()
+        fixTabBar()
+
+        takeHiddenDockIfAvailable()
 
         // Re-hide the dock if we were hiding it before.
         hiddenDock?.hide()
@@ -174,6 +308,29 @@ class QuickTerminalController: BaseTerminalController {
         // ensures we don't run logic twice.
         guard visible else { return }
 
+        if isAutoHideSuppressed() {
+            return
+        }
+
+        // When the app deactivates (alt-tab), we don't auto-hide. The quick terminal
+        // visibility should be controlled explicitly by toggle.
+        if !NSApp.isActive {
+            hiddenDock?.restore()
+            return
+        }
+
+        if NSApp.isActive {
+            if let keyWindow = NSApp.keyWindow,
+               keyWindow.windowController is QuickTerminalController {
+                return
+            }
+
+            if let tabGroup = window?.tabGroup,
+               tabGroup.windows.contains(where: { $0 != window && $0.windowController is QuickTerminalController }) {
+                return
+            }
+        }
+
         // We don't animate out if there is a modal sheet being shown currently.
         // This lets us show alerts without causing the window to disappear.
         guard window?.attachedSheet == nil else { return }
@@ -182,7 +339,7 @@ class QuickTerminalController: BaseTerminalController {
         // to another window within our app, so we remove the previous app
         // so we don't restore it.
         if NSApp.isActive {
-            self.previousApp = nil
+            setTabGroupPreviousApp(nil)
         }
 
         // Regardless of autohide, we always want to bring the dock back
@@ -219,9 +376,39 @@ class QuickTerminalController: BaseTerminalController {
                     }
 
                     self.previousActiveSpace = currentActiveSpace
+                    setTabGroupPreviousActiveSpace(currentActiveSpace)
                 }
             }
         }
+    }
+
+    override func windowShouldClose(_ sender: NSWindow) -> Bool {
+        tabGroupCloseCoordinator.windowShouldClose(sender) { [weak self] scope in
+            guard let self else { return }
+            switch scope {
+            case .tab:
+                closeTab(nil)
+            case .window:
+                guard self.window?.isFirstWindowInTabGroup ?? false else { return }
+                closeWindow(self)
+            }
+        }
+
+        return false
+    }
+
+    override func windowWillClose(_ notification: Notification) {
+        super.windowWillClose(notification)
+        relabelTabs()
+        if let window = notification.object as? NSWindow {
+            Self.updateLastActive(afterClosing: window.tabGroup)
+        }
+    }
+
+    // Shows the "+" button in the tab bar, responds to that click.
+    override func newWindowForTab(_ sender: Any?) {
+        guard let surface = focusedSurface?.surface else { return }
+        ghostty.newTab(surface: surface)
     }
 
     override func windowDidResize(_ notification: Notification) {
@@ -246,6 +433,11 @@ class QuickTerminalController: BaseTerminalController {
             let newOrigin = position.verticallyCenteredOrigin(for: window, on: screen)
             window.setFrameOrigin(newOrigin)
         }
+    }
+
+    override func pwdDidChange(to: URL?) {
+        // Quick terminals never display a titlebar proxy icon.
+        window?.representedURL = nil
     }
 
     // MARK: Base Controller Overrides
@@ -301,6 +493,12 @@ class QuickTerminalController: BaseTerminalController {
             return
         }
 
+        // If we have multiple tabs, close this tab instead of hiding.
+        if window?.tabGroup?.windows.count ?? 0 > 1 {
+            closeTab(nil)
+            return
+        }
+
         // If its the root, we check if the process exited. If it did,
         // then we do empty the tree.
         if surface.processExited {
@@ -313,13 +511,311 @@ class QuickTerminalController: BaseTerminalController {
         animateOut()
     }
 
+    // MARK: Tab Management
+
+    func relabelTabs() {
+        tabListenForFrame = window?.tabbedWindows?.count ?? 0 > 1
+
+        if let windows = window?.tabbedWindows {
+            for (tab, window) in zip(1..., windows) {
+                guard let quickWindow = window as? QuickTerminalWindow else { continue }
+                guard tab <= 9 else {
+                    quickWindow.keyEquivalent = ""
+                    continue
+                }
+
+                if let equiv = ghostty.config.keyboardShortcut(for: "goto_tab:\(tab)") {
+                    quickWindow.keyEquivalent = "\(equiv)"
+                } else {
+                    quickWindow.keyEquivalent = ""
+                }
+            }
+        }
+    }
+
+    private func fixTabBar() {
+        if let window, !window.isOpaque {
+            window.isOpaque = true
+            window.isOpaque = false
+        }
+    }
+
+    @objc private func onFrameDidChange(_ notification: NSNotification) {
+        guard tabListenForFrame else { return }
+        guard let v = window?.tabbedWindows?.hashValue else { return }
+        guard tabWindowsHash != v else { return }
+        tabWindowsHash = v
+        relabelTabs()
+    }
+
+    // MARK: Methods
+
+    // MARK: Quick Terminal Creation
+
+    static var all: [QuickTerminalController] {
+        return NSApplication.shared.windows.compactMap {
+            $0.windowController as? QuickTerminalController
+        }
+    }
+
+    static func newTab(
+        _ ghostty: Ghostty.App,
+        from parent: NSWindow? = nil,
+        withBaseConfig baseConfig: Ghostty.SurfaceConfiguration? = nil
+    ) -> QuickTerminalController? {
+        guard let parent,
+              let parentController = parent.windowController as? QuickTerminalController else {
+            return nil
+        }
+
+        parentController.suppressAutoHide()
+
+        if let fullscreenStyle = parentController.fullscreenStyle,
+           fullscreenStyle.isFullscreen && !fullscreenStyle.supportsTabs {
+            let alert = NSAlert()
+            alert.messageText = "Cannot Create New Tab"
+            alert.informativeText = "New tabs are unsupported while in non-native fullscreen. Exit fullscreen and try again."
+            alert.addButton(withTitle: "OK")
+            alert.alertStyle = .warning
+            alert.beginSheetModal(for: parent)
+            return nil
+        }
+
+        let controller = QuickTerminalController(
+            ghostty,
+            position: parentController.position,
+            baseConfig: baseConfig,
+            animateOnLoad: false
+        )
+
+        guard let window = controller.window else { return controller }
+        Self.lastActiveController = controller
+
+        if parent.isMiniaturized { parent.deminiaturize(self) }
+
+        if let tg = parent.tabGroup,
+           tg.windows.firstIndex(of: window) != nil {
+            tg.removeWindow(window)
+        }
+
+        if window.tabbingMode != .disallowed {
+            switch ghostty.config.windowNewTabPosition {
+            case "end":
+                if let last = parent.tabGroup?.windows.last {
+                    last.addTabbedWindow(window, ordered: .above)
+                } else {
+                    fallthrough
+                }
+            case "current": fallthrough
+            default:
+                parent.addTabbedWindow(window, ordered: .above)
+            }
+        } else {
+            let alert = NSAlert()
+            alert.messageText = "Tabs Are Disabled"
+            alert.informativeText = "Enable the tabs titlebar style to use tabs in the quick terminal."
+            alert.addButton(withTitle: "OK")
+            alert.alertStyle = .warning
+            alert.beginSheetModal(for: parent)
+            return nil
+        }
+
+        DispatchQueue.main.async {
+            controller.showWindowWithoutAnimation(from: parentController)
+        }
+
+        return controller
+    }
+
     // MARK: Methods
 
     func toggle() {
-        if (visible) {
+        if (isTabGroupVisible()) {
             animateOut()
         } else {
+            if let lastActive = Self.lastActiveController, lastActive !== self {
+                lastActive.toggle()
+                return
+            }
             animateIn()
+        }
+    }
+
+    private func prepareSurfaceTreeIfNeeded() {
+        guard surfaceTree.isEmpty, let ghostty_app = ghostty.app else { return }
+
+        if let tree = restorationState?.surfaceTree, !tree.isEmpty {
+            surfaceTree = tree
+            let view = tree.first(where: { $0.id.uuidString == restorationState?.focusedSurface }) ?? tree.first!
+            focusedSurface = view
+            // Add a short delay to check if the correct surface is focused.
+            // Each SurfaceWrapper defaults its FocusedValue to itself; without this delay,
+            // the tree often focuses the first surface instead of the intended one.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                if !view.focused {
+                    self.focusedSurface = view
+                    if let window = self.window {
+                        self.makeWindowKey(window)
+                    }
+                }
+            }
+        } else {
+            var config = baseSurfaceConfig ?? Ghostty.SurfaceConfiguration()
+            config.environmentVariables["GHOSTTY_QUICK_TERMINAL"] = "1"
+
+            let view = Ghostty.SurfaceView(ghostty_app, baseConfig: config)
+            surfaceTree = SplitTree(view: view)
+            focusedSurface = view
+        }
+
+        baseSurfaceConfig = nil
+        restorationState = nil
+    }
+
+    private func takeHiddenDockIfAvailable() {
+        guard hiddenDock == nil else { return }
+        guard let donor = Self.all.first(where: { $0 !== self && $0.hiddenDock != nil }) else { return }
+        hiddenDock = donor.hiddenDock
+        donor.hiddenDock = nil
+    }
+
+    private func tabGroupControllers(for window: NSWindow?) -> [QuickTerminalController] {
+        guard let window else { return [self] }
+
+        if let tabGroup = window.tabGroup {
+            let controllers = tabGroup.windows.compactMap {
+                $0.windowController as? QuickTerminalController
+            }
+            return controllers.isEmpty ? [self] : controllers
+        }
+
+        if let tabbedWindows = window.tabbedWindows {
+            let controllers = tabbedWindows.compactMap {
+                $0.windowController as? QuickTerminalController
+            }
+            return controllers.isEmpty ? [self] : controllers
+        }
+
+        // Fall back to all quick terminal windows if tabbing is enabled but
+        // the tab group isn't available yet. This keeps multi-tab hides safe.
+        if window.tabbingMode != .disallowed {
+            let controllers = QuickTerminalController.all
+            if controllers.count > 1 {
+                return controllers
+            }
+        }
+
+        return [self]
+    }
+
+    private func isTabGroupVisible() -> Bool {
+        tabGroupControllers(for: window).contains(where: { $0.visible })
+    }
+
+    private func setTabGroupVisible(_ visible: Bool) {
+        let controllers = tabGroupControllers(for: window)
+        let changed = controllers.contains(where: { $0.visible != visible })
+
+        for controller in controllers {
+            controller.visible = visible
+        }
+
+        if changed {
+            NotificationCenter.default.post(
+                name: .quickTerminalDidChangeVisibility,
+                object: self
+            )
+        }
+    }
+
+    private func setTabGroupPreviousApp(_ app: NSRunningApplication?) {
+        for controller in tabGroupControllers(for: window) {
+            controller.previousApp = app
+        }
+    }
+
+    private func setTabGroupPreviousActiveSpace(_ space: CGSSpace?) {
+        for controller in tabGroupControllers(for: window) {
+            controller.previousActiveSpace = space
+        }
+    }
+
+    private static func recordLastActive(for window: NSWindow?) {
+        guard let controller = window?.windowController as? QuickTerminalController else { return }
+        Self.lastActiveController = controller
+    }
+
+    private static func updateLastActive(afterClosing tabGroup: NSWindowTabGroup?) {
+        DispatchQueue.main.async {
+            if let selected = tabGroup?.selectedWindow,
+               let controller = selected.windowController as? QuickTerminalController {
+                Self.lastActiveController = controller
+                if !NSApp.isActive {
+                    selected.level = .floating
+                    selected.alphaValue = 1
+                    selected.ignoresMouseEvents = false
+                    selected.orderFrontRegardless()
+                }
+                return
+            }
+
+            if let controller = QuickTerminalController.all.first {
+                Self.lastActiveController = controller
+            } else {
+                Self.lastActiveController = nil
+            }
+        }
+    }
+
+    private func suppressAutoHide(for interval: TimeInterval = 0.25) {
+        autoHideSuppressionDeadline = max(
+            autoHideSuppressionDeadline,
+            Date.timeIntervalSinceReferenceDate + interval
+        )
+    }
+
+    private func isAutoHideSuppressed() -> Bool {
+        Date.timeIntervalSinceReferenceDate < autoHideSuppressionDeadline
+    }
+
+    private func showWindowWithoutAnimation(from parent: QuickTerminalController) {
+        guard let window = self.window else { return }
+
+        setTabGroupVisible(true)
+
+        previousApp = parent.previousApp
+        previousActiveSpace = parent.previousActiveSpace
+        setTabGroupPreviousApp(previousApp)
+        setTabGroupPreviousActiveSpace(previousActiveSpace)
+
+        if hiddenDock == nil {
+            hiddenDock = parent.hiddenDock
+            parent.hiddenDock = nil
+        }
+
+        prepareSurfaceTreeIfNeeded()
+
+        if let parentWindow = parent.window {
+            window.setFrame(parentWindow.frame, display: false)
+            window.level = parentWindow.level
+        } else {
+            window.level = .floating
+        }
+
+        // Ensure we restore visibility when a tabbed window was hidden via alpha.
+        window.alphaValue = 1
+        window.ignoresMouseEvents = false
+
+        window.makeKeyAndOrderFront(nil)
+        syncAppearance()
+        makeWindowKey(window)
+
+        if !NSApp.isActive {
+            NSApp.activate(ignoringOtherApps: true)
+            DispatchQueue.main.async {
+                guard !window.isKeyWindow else { return }
+                self.makeWindowKey(window, retries: 10)
+            }
         }
     }
 
@@ -327,14 +823,12 @@ class QuickTerminalController: BaseTerminalController {
         guard let window = self.window else { return }
 
         // Set our visibility state
-        guard !visible else { return }
-        visible = true
+        guard !isTabGroupVisible() else { return }
+        setTabGroupVisible(true)
 
-        // Notify the change
-        NotificationCenter.default.post(
-            name: .quickTerminalDidChangeVisibility,
-            object: self
-        )
+        if let tabGroup = window.tabGroup {
+            tabGroup.selectedWindow = window
+        }
 
         // If we have a previously focused application and it isn't us, then
         // we want to store it so we can restore state later.
@@ -343,60 +837,82 @@ class QuickTerminalController: BaseTerminalController {
                previousApp.bundleIdentifier != Bundle.main.bundleIdentifier
             {
                 self.previousApp = previousApp
+                setTabGroupPreviousApp(previousApp)
             }
         }
 
         // Set previous active space
-        self.previousActiveSpace = CGSSpace.active()
+        let activeSpace = CGSSpace.active()
+        self.previousActiveSpace = activeSpace
+        setTabGroupPreviousActiveSpace(activeSpace)
 
         // If our surface tree is empty then we initialize a new terminal. The surface
         // tree can be empty if for example we run "exit" in the terminal and force
         // animate out.
-        if surfaceTree.isEmpty,
-           let ghostty_app = ghostty.app {
-            if let tree = restorationState?.surfaceTree, !tree.isEmpty {
-                surfaceTree = tree
-                let view = tree.first(where: { $0.id.uuidString == restorationState?.focusedSurface }) ?? tree.first!
-                focusedSurface = view
-                // Add a short delay to check if the correct surface is focused.
-                // Each SurfaceWrapper defaults its FocusedValue to itself; without this delay,
-                // the tree often focuses the first surface instead of the intended one.
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                    if !view.focused {
-                        self.focusedSurface = view
-                        self.makeWindowKey(window)
-                    }
-                }
-            } else {
-                var config = Ghostty.SurfaceConfiguration()
-                config.environmentVariables["GHOSTTY_QUICK_TERMINAL"] = "1"
-                
-                let view = Ghostty.SurfaceView(ghostty_app, baseConfig: config)
-                surfaceTree = SplitTree(view: view)
-                focusedSurface = view
-            }
-        }
+        prepareSurfaceTreeIfNeeded()
+
+        // Ensure we restore visibility when a tabbed window was hidden via alpha.
+        window.alphaValue = 1
+        window.ignoresMouseEvents = false
 
         // Animate the window in
         animateWindowIn(window: window, from: position)
-        // Clear the restoration state after first use
-        restorationState = nil
     }
 
     func animateOut() {
         guard let window = self.window else { return }
 
-        // Set our visibility state
-        guard visible else { return }
-        visible = false
+        Self.recordLastActive(for: window)
+        if let tabGroup = window.tabGroup {
+            tabGroup.selectedWindow = window
+        }
 
-        // Notify the change
-        NotificationCenter.default.post(
-            name: .quickTerminalDidChangeVisibility,
-            object: self
-        )
+        // Set our visibility state
+        guard isTabGroupVisible() else { return }
+        setTabGroupVisible(false)
 
         animateWindowOut(window: window, to: position)
+    }
+
+    private func closeTabImmediately() {
+        guard let window = window else { return }
+        guard let tabGroup = window.tabGroup,
+              tabGroup.windows.count > 1 else {
+            animateOut()
+            return
+        }
+
+        window.close()
+        Self.updateLastActive(afterClosing: tabGroup)
+    }
+
+    private func closeOtherTabsImmediately() {
+        guard let window = window else { return }
+        guard let tabGroup = window.tabGroup else { return }
+        guard tabGroup.windows.count > 1 else { return }
+
+        for tabWindow in tabGroup.windows where tabWindow != self.window {
+            if let controller = tabWindow.windowController as? QuickTerminalController {
+                controller.closeTabImmediately()
+            }
+        }
+
+        Self.updateLastActive(afterClosing: tabGroup)
+    }
+
+    private func closeTabsOnTheRightImmediately() {
+        guard let window = window else { return }
+        guard let tabGroup = window.tabGroup else { return }
+        guard let currentIndex = tabGroup.windows.firstIndex(of: window) else { return }
+
+        let tabsToClose = tabGroup.windows.enumerated().filter { $0.offset > currentIndex }
+        for (_, tabWindow) in tabsToClose {
+            if let controller = tabWindow.windowController as? QuickTerminalController {
+                controller.closeTabImmediately()
+            }
+        }
+
+        Self.updateLastActive(afterClosing: tabGroup)
     }
 
     func saveScreenState(exitFullscreen: Bool) {
@@ -547,12 +1063,8 @@ class QuickTerminalController: BaseTerminalController {
         // If the window isn't on our active space then we don't animate, we just
         // hide it.
         if !window.isOnActiveSpace {
-            self.previousApp = nil
-            window.orderOut(self)
-            // If our application is hidden previously, we hide it again
-            if (NSApp.delegate as? AppDelegate)?.hiddenState != nil {
-                NSApp.hide(nil)
-            }
+            setTabGroupPreviousApp(nil)
+            hideWindowAfterAnimation(window: window)
             return
         }
 
@@ -564,7 +1076,7 @@ class QuickTerminalController: BaseTerminalController {
         // macOS will bring forward another window.
         if let previousApp = self.previousApp {
             // Make sure we unset the state no matter what
-            self.previousApp = nil
+            setTabGroupPreviousApp(nil)
 
             if !previousApp.isTerminated {
                 // Ignore the result, it doesn't change our behavior.
@@ -586,14 +1098,55 @@ class QuickTerminalController: BaseTerminalController {
                 terminalSize: derivedConfig.quickTerminalSize,
                 closedFrame: window.frame)
         }, completionHandler: {
-            // This causes the window to be removed from the screen list and macOS
-            // handles what should be focused next.
-            window.orderOut(self)
-            // If our application is hidden previously, we hide it again
-            if (NSApp.delegate as? AppDelegate)?.hiddenState != nil {
-                NSApp.hide(nil)
-            }
+            self.hideWindowAfterAnimation(window: window)
         })
+    }
+
+    private func hideWindowAfterAnimation(window: NSWindow) {
+        let hasMultipleTabs = tabGroupControllers(for: window).count > 1
+
+        if hasMultipleTabs {
+            // Preserve tabs by keeping the window alive but fully hidden.
+            window.alphaValue = 0
+            window.ignoresMouseEvents = true
+            window.level = .normal
+            if NSApp.isActive {
+                focusAfterHide(excluding: window)
+            }
+        } else {
+            // For single-tab windows we can safely order out.
+            window.orderOut(self)
+        }
+
+        // If our application is hidden previously, we hide it again
+        if (NSApp.delegate as? AppDelegate)?.hiddenState != nil {
+            NSApp.hide(nil)
+        }
+    }
+
+    private func focusAfterHide(excluding window: NSWindow) {
+        if let previousApp, !previousApp.isTerminated {
+            _ = previousApp.activate(options: [])
+            return
+        }
+
+        if let otherWindow = NSApp.windows.first(where: {
+            $0 != window &&
+            $0.isVisible &&
+            !($0.windowController is QuickTerminalController)
+        }) {
+            otherWindow.makeKeyAndOrderFront(nil)
+            return
+        }
+
+        if let otherWindow = NSApp.windows.first(where: {
+            $0 != window && $0.isVisible
+        }) {
+            otherWindow.makeKeyAndOrderFront(nil)
+            return
+        }
+
+        window.resignKey()
     }
 
     override func syncAppearance() {
@@ -606,6 +1159,13 @@ class QuickTerminalController: BaseTerminalController {
         // If our window is not visible, then no need to sync the appearance yet.
         // Some APIs such as window blur have no effect unless the window is visible.
         guard window.isVisible else { return }
+
+        // Keep the borderless style applied for undecorated quick terminals.
+        if let qtWindow = window as? QuickTerminalWindow,
+           !derivedConfig.quickTerminalDecoration,
+           !(fullscreenStyle?.isFullscreen ?? false) {
+            qtWindow.applyBorderlessStyle()
+        }
 
         // If we have window transparency then set it transparent. Otherwise set it opaque.
         // Also check if the user has overridden transparency to be fully opaque.
@@ -624,26 +1184,133 @@ class QuickTerminalController: BaseTerminalController {
             window.isOpaque = true
             window.backgroundColor = .windowBackgroundColor
         }
+
+        if let surfaceConfig = focusedSurface?.derivedConfig,
+           let qtWindow = window as? QuickTerminalWindow {
+            qtWindow.surfaceIsZoomed = surfaceTree.zoomed != nil
+
+            if let titleFontName = surfaceConfig.windowTitleFontFamily {
+                qtWindow.titlebarFont = NSFont(name: titleFontName, size: NSFont.systemFontSize)
+            } else {
+                qtWindow.titlebarFont = nil
+            }
+
+            qtWindow.syncAppearance(surfaceConfig)
+        }
     }
 
-    private func showNoNewTabAlert() {
-        guard let window else { return }
-        let alert = NSAlert()
-        alert.messageText = "Cannot Create New Tab"
-        alert.informativeText = "Tabs aren't supported in the Quick Terminal."
-        alert.addButton(withTitle: "OK")
-        alert.alertStyle = .warning
-        alert.beginSheetModal(for: window)
+    private func shouldAllowBackgroundFocus() -> Bool {
+        guard !NSApp.isActive else { return false }
+        guard visible else { return false }
+        guard let window, isEffectivelyVisible else { return false }
+
+        if let tabGroup = window.tabGroup {
+            return tabGroup.selectedWindow == window
+        }
+
+        return true
     }
+
+    override func syncFocusToSurfaceTree() {
+        let allowBackgroundFocus = shouldAllowBackgroundFocus()
+
+        for surfaceView in surfaceTree {
+            let isFocusedSurface = focusedSurface != nil && surfaceView == focusedSurface!
+            let focused = (window?.isKeyWindow ?? false) || allowBackgroundFocus
+            surfaceView.focusDidChange(focused && !commandPaletteIsShowing && isFocusedSurface)
+        }
+    }
+
     // MARK: First Responder
 
     @IBAction override func closeWindow(_ sender: Any) {
+        guard let window = window else { return }
+
+        if window.tabGroup?.windows.count ?? 0 > 1 {
+            closeTab(sender)
+            return
+        }
+
         // Instead of closing the window, we animate it out.
         animateOut()
     }
 
     @IBAction func newTab(_ sender: Any?) {
-        showNoNewTabAlert()
+        guard let surface = focusedSurface?.surface else { return }
+        ghostty.newTab(surface: surface)
+    }
+
+    @IBAction func closeTab(_ sender: Any?) {
+        guard let window = window else { return }
+        guard window.tabGroup?.windows.count ?? 0 > 1 else {
+            animateOut()
+            return
+        }
+
+        guard surfaceTree.contains(where: { $0.needsConfirmQuit }) else {
+            closeTabImmediately()
+            return
+        }
+
+        confirmClose(
+            messageText: "Close Tab?",
+            informativeText: "The terminal still has a running process. If you close the tab the process will be killed."
+        ) {
+            self.closeTabImmediately()
+        }
+    }
+
+    @IBAction func closeOtherTabs(_ sender: Any?) {
+        guard let window = window else { return }
+        guard let tabGroup = window.tabGroup else { return }
+        guard tabGroup.windows.count > 1 else { return }
+
+        guard tabGroup.windows.contains(where: { candidate in
+            if candidate == self.window { return false }
+            guard let controller = candidate.windowController as? QuickTerminalController else {
+                return false
+            }
+            return controller.surfaceTree.contains(where: { $0.needsConfirmQuit })
+        }) else {
+            closeOtherTabsImmediately()
+            return
+        }
+
+        confirmClose(
+            messageText: "Close Other Tabs?",
+            informativeText: "At least one other tab still has a running process. If you close the tab the process will be killed."
+        ) {
+            self.closeOtherTabsImmediately()
+        }
+    }
+
+    @IBAction func closeTabsOnTheRight(_ sender: Any?) {
+        guard let window = window else { return }
+        guard let tabGroup = window.tabGroup else { return }
+        guard let currentIndex = tabGroup.windows.firstIndex(of: window) else { return }
+
+        let tabsToClose = tabGroup.windows.enumerated().filter { $0.offset > currentIndex }
+        guard !tabsToClose.isEmpty else { return }
+
+        let needsConfirm = tabsToClose.contains { (_, candidate) in
+            guard let controller = candidate.windowController as? QuickTerminalController else {
+                return false
+            }
+
+            return controller.surfaceTree.contains(where: { $0.needsConfirmQuit })
+        }
+
+        if !needsConfirm {
+            closeTabsOnTheRightImmediately()
+            return
+        }
+
+        confirmClose(
+            messageText: "Close Tabs on the Right?",
+            informativeText: "At least one tab to the right still has a running process. If you close the tab the process will be killed."
+        ) {
+            self.closeTabsOnTheRightImmediately()
+        }
     }
 
     @IBAction func toggleGhosttyFullScreen(_ sender: Any) {
@@ -669,6 +1336,139 @@ class QuickTerminalController: BaseTerminalController {
         guard let target = notification.object as? Ghostty.SurfaceView else { return }
         guard target == self.focusedSurface else { return }
         onToggleFullscreen()
+    }
+
+    @objc private func onMoveTab(notification: SwiftUI.Notification) {
+        guard let target = notification.object as? Ghostty.SurfaceView else { return }
+        guard target == self.focusedSurface else { return }
+        guard let window = self.window else { return }
+
+        suppressAutoHide()
+
+        guard let action = notification.userInfo?[Notification.Name.GhosttyMoveTabKey] as? Ghostty.Action.MoveTab else { return }
+        guard action.amount != 0 else { return }
+
+        guard let windowController = window.windowController else { return }
+        guard let tabGroup = windowController.window?.tabGroup else { return }
+        guard let selectedWindow = tabGroup.selectedWindow else { return }
+        let tabbedWindows = tabGroup.windows
+        guard tabbedWindows.count > 0 else { return }
+        guard let selectedIndex = tabbedWindows.firstIndex(where: { $0 == selectedWindow }) else { return }
+
+        let finalIndex: Int
+        if action.amount < 0 {
+            finalIndex = selectedIndex - min(selectedIndex, -action.amount)
+        } else {
+            let remaining: Int = tabbedWindows.count - 1 - selectedIndex
+            finalIndex = selectedIndex + min(remaining, action.amount)
+        }
+
+        guard finalIndex != selectedIndex else { return }
+
+        let targetWindow = tabbedWindows[finalIndex]
+
+        if #available(macOS 26, *) {
+            if window is TitlebarTabsTahoeQuickTerminalWindow {
+                tabGroup.removeWindow(selectedWindow)
+                targetWindow.addTabbedWindow(selectedWindow, ordered: action.amount < 0 ? .below : .above)
+                DispatchQueue.main.async {
+                    if NSApp.isActive {
+                        selectedWindow.makeKey()
+                    } else {
+                        tabGroup.selectedWindow = selectedWindow
+                        selectedWindow.level = .floating
+                        selectedWindow.orderFrontRegardless()
+                    }
+                    Self.recordLastActive(for: selectedWindow)
+                    (selectedWindow.windowController as? QuickTerminalController)?.syncFocusToSurfaceTree()
+                }
+
+                return
+            }
+        }
+
+        NSAnimationContext.beginGrouping()
+        NSAnimationContext.current.duration = 0
+
+        tabGroup.removeWindow(selectedWindow)
+        targetWindow.addTabbedWindow(selectedWindow, ordered: action.amount < 0 ? .below : .above)
+        if NSApp.isActive {
+            selectedWindow.makeKey()
+        } else {
+            tabGroup.selectedWindow = selectedWindow
+            selectedWindow.level = .floating
+            selectedWindow.orderFrontRegardless()
+        }
+        Self.recordLastActive(for: selectedWindow)
+        (selectedWindow.windowController as? QuickTerminalController)?.syncFocusToSurfaceTree()
+
+        NSAnimationContext.endGrouping()
+    }
+
+    @objc private func onGotoTab(notification: SwiftUI.Notification) {
+        guard let target = notification.object as? Ghostty.SurfaceView else { return }
+        guard target == self.focusedSurface else { return }
+        guard let window = self.window else { return }
+
+        suppressAutoHide()
+
+        guard let tabEnumAny = notification.userInfo?[Ghostty.Notification.GotoTabKey] else { return }
+        guard let tabEnum = tabEnumAny as? ghostty_action_goto_tab_e else { return }
+        let tabIndex: Int32 = tabEnum.rawValue
+
+        guard let windowController = window.windowController else { return }
+        guard let tabGroup = windowController.window?.tabGroup else { return }
+        let tabbedWindows = tabGroup.windows
+
+        let finalIndex: Int
+
+        if tabIndex <= 0 {
+            guard let selectedWindow = tabGroup.selectedWindow else { return }
+            guard let selectedIndex = tabbedWindows.firstIndex(where: { $0 == selectedWindow }) else { return }
+
+            if tabIndex == GHOSTTY_GOTO_TAB_PREVIOUS.rawValue {
+                finalIndex = selectedIndex == 0 ? tabbedWindows.count - 1 : selectedIndex - 1
+            } else if tabIndex == GHOSTTY_GOTO_TAB_NEXT.rawValue {
+                finalIndex = selectedIndex == tabbedWindows.count - 1 ? 0 : selectedIndex + 1
+            } else if tabIndex == GHOSTTY_GOTO_TAB_LAST.rawValue {
+                finalIndex = tabbedWindows.count - 1
+            } else {
+                return
+            }
+        } else {
+            guard tabIndex >= 1 else { return }
+            finalIndex = min(Int(tabIndex - 1), tabbedWindows.count - 1)
+        }
+
+        guard finalIndex >= 0 else { return }
+        let targetWindow = tabbedWindows[finalIndex]
+        if NSApp.isActive {
+            targetWindow.makeKeyAndOrderFront(nil)
+        } else {
+            tabGroup.selectedWindow = targetWindow
+            targetWindow.level = .floating
+            targetWindow.orderFrontRegardless()
+        }
+        Self.recordLastActive(for: targetWindow)
+        (targetWindow.windowController as? QuickTerminalController)?.syncFocusToSurfaceTree()
+    }
+
+    @objc private func onCloseTab(notification: SwiftUI.Notification) {
+        guard let target = notification.object as? Ghostty.SurfaceView else { return }
+        guard surfaceTree.contains(target) else { return }
+        closeTab(self)
+    }
+
+    @objc private func onCloseOtherTabs(notification: SwiftUI.Notification) {
+        guard let target = notification.object as? Ghostty.SurfaceView else { return }
+        guard surfaceTree.contains(target) else { return }
+        closeOtherTabs(self)
+    }
+
+    @objc private func onCloseTabsOnTheRight(notification: SwiftUI.Notification) {
+        guard let target = notification.object as? Ghostty.SurfaceView else { return }
+        guard surfaceTree.contains(target) else { return }
+        closeTabsOnTheRight(self)
     }
 
     private func onToggleFullscreen() {
@@ -703,8 +1503,22 @@ class QuickTerminalController: BaseTerminalController {
             Notification.Name.GhosttyConfigChangeKey
         ] as? Ghostty.Config else { return }
 
+        let newStyleSignature = Self.windowStyleSignature(for: config)
+
         // Update our derived config
         self.derivedConfig = DerivedConfig(config)
+
+        if let loadedWindowStyleSignature,
+           newStyleSignature != loadedWindowStyleSignature,
+           let appDelegate = NSApp.delegate as? AppDelegate {
+            let wasVisible = visible
+            appDelegate.recreateQuickTerminal(
+                from: self,
+                animationDuration: derivedConfig.quickTerminalAnimationDuration,
+                wasVisible: wasVisible
+            )
+            return
+        }
 
         syncAppearance()
     }
@@ -712,9 +1526,12 @@ class QuickTerminalController: BaseTerminalController {
     @objc private func onNewTab(notification: SwiftUI.Notification) {
         guard let surfaceView = notification.object as? Ghostty.SurfaceView else { return }
         guard let window = surfaceView.window else { return }
-        guard window.windowController is QuickTerminalController else { return }
-        // Tabs aren't supported with Quick Terminals or derivatives
-        showNoNewTabAlert()
+        guard let parentController = window.windowController as? QuickTerminalController else { return }
+        guard parentController === self else { return }
+
+        let configAny = notification.userInfo?[Ghostty.Notification.NewSurfaceConfigKey]
+        let config = configAny as? Ghostty.SurfaceConfiguration
+        _ = QuickTerminalController.newTab(ghostty, from: window, withBaseConfig: config)
     }
 
     private struct DerivedConfig {
@@ -723,6 +1540,8 @@ class QuickTerminalController: BaseTerminalController {
         let quickTerminalAutoHide: Bool
         let quickTerminalSpaceBehavior: QuickTerminalSpaceBehavior
         let quickTerminalSize: QuickTerminalSize
+        let quickTerminalTitlebarStyle: String
+        let quickTerminalDecoration: Bool
         let backgroundOpacity: Double
         let backgroundBlur: Ghostty.Config.BackgroundBlur
 
@@ -732,6 +1551,8 @@ class QuickTerminalController: BaseTerminalController {
             self.quickTerminalAutoHide = true
             self.quickTerminalSpaceBehavior = .move
             self.quickTerminalSize = QuickTerminalSize()
+            self.quickTerminalTitlebarStyle = "hidden"
+            self.quickTerminalDecoration = false
             self.backgroundOpacity = 1.0
             self.backgroundBlur = .disabled
         }
@@ -742,6 +1563,8 @@ class QuickTerminalController: BaseTerminalController {
             self.quickTerminalAutoHide = config.quickTerminalAutoHide
             self.quickTerminalSpaceBehavior = config.quickTerminalSpaceBehavior
             self.quickTerminalSize = config.quickTerminalSize
+            self.quickTerminalTitlebarStyle = config.quickTerminalTitlebarStyle
+            self.quickTerminalDecoration = config.quickTerminalDecoration
             self.backgroundOpacity = config.backgroundOpacity
             self.backgroundBlur = config.backgroundBlur
         }

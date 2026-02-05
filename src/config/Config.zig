@@ -2599,6 +2599,26 @@ keybind: Keybinds = .{},
 /// Only implemented on macOS.
 @"quick-terminal-screen": QuickTerminalScreen = .main,
 
+/// The style of the quick terminal titlebar. This is independent from the
+/// global macOS titlebar style and only applies to the quick terminal.
+///
+/// Valid values are: "native", "transparent", "hidden", and "tabs".
+///
+/// Only implemented on macOS.
+@"quick-terminal-titlebar-style": MacTitlebarStyle = .hidden,
+
+/// Whether the quick terminal should use window decorations. When enabled,
+/// Ghostty keeps a titled window frame but hides the titlebar chrome so the
+/// system draws the native rounded window edges. When disabled, the quick
+/// terminal is fully borderless with squared corners.
+///
+/// The default value depends on the quick terminal position:
+///   - `center` defaults to true
+///   - all other positions default to false
+///
+/// Only implemented on macOS.
+@"quick-terminal-decoration": ?bool = null,
+
 /// Duration (in seconds) of the quick terminal enter and exit animation.
 /// Set it to 0 to disable animation completely. This can be changed at
 /// runtime.
@@ -4504,6 +4524,14 @@ pub fn finalize(self: *Config) !void {
     // Minimum window size
     if (self.@"window-width" > 0) self.@"window-width" = @max(10, self.@"window-width");
     if (self.@"window-height" > 0) self.@"window-height" = @max(4, self.@"window-height");
+
+    // Default quick terminal decorations based on position if unset.
+    if (self.@"quick-terminal-decoration" == null) {
+        self.@"quick-terminal-decoration" = switch (self.@"quick-terminal-position") {
+            .center => true,
+            else => false,
+        };
+    }
 
     // If URLs are disabled, cut off the first link. The first link is
     // always the URL matcher.

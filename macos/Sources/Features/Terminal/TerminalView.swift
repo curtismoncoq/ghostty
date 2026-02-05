@@ -35,6 +35,10 @@ protocol TerminalViewModel: ObservableObject {
     
     /// The update overlay should be visible.
     var updateOverlayIsVisible: Bool { get }
+
+    /// True if this window should ignore the top safe area regardless of
+    /// the global macOS titlebar style.
+    var forceIgnoreSafeAreaTop: Bool { get }
 }
 
 /// The main terminal view. This terminal view supports splits.
@@ -104,8 +108,11 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
                         .frame(idealWidth: lastFocusedSurface.value?.initialSize?.width,
                                idealHeight: lastFocusedSurface.value?.initialSize?.height)
                 }
-                // Ignore safe area to extend up in to the titlebar region if we have the "hidden" titlebar style
-                .ignoresSafeArea(.container, edges: ghostty.config.macosTitlebarStyle == "hidden" ? .top : [])
+                // Ignore safe area to extend into the titlebar region when requested by the view model.
+                .ignoresSafeArea(
+                    .container,
+                    edges: viewModel.forceIgnoreSafeAreaTop ? .top : []
+                )
 
                 if let surfaceView = lastFocusedSurface.value {
                     TerminalCommandPaletteView(

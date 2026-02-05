@@ -494,6 +494,28 @@ extension Ghostty {
             return QuickTerminalScreen(fromGhosttyConfig: str) ?? .main
         }
 
+        var quickTerminalTitlebarStyle: String {
+            let defaultValue = "hidden"
+            guard let config = self.config else { return defaultValue }
+            var v: UnsafePointer<Int8>? = nil
+            let key = "quick-terminal-titlebar-style"
+            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return defaultValue }
+            guard let ptr = v else { return defaultValue }
+            return String(cString: ptr)
+        }
+
+        var quickTerminalDecoration: Bool {
+            guard let config = self.config else {
+                return quickTerminalPosition == .center
+            }
+            var v = false
+            let key = "quick-terminal-decoration"
+            if ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) {
+                return v
+            }
+            return quickTerminalPosition == .center
+        }
+
         var quickTerminalAnimationDuration: Double {
             guard let config = self.config else { return 0.2 }
             var v: Double = 0.2

@@ -52,6 +52,10 @@ class BaseTerminalController: NSWindowController,
     /// Set if the terminal view should show the update overlay.
     @Published var updateOverlayIsVisible: Bool = false
 
+    /// Override to ignore the top safe area. By default we follow the global macOS
+    /// titlebar style configuration.
+    var forceIgnoreSafeAreaTop: Bool { ghostty.config.macosTitlebarStyle == "hidden" }
+
     /// Whether the terminal surface should focus when the mouse is over it.
     var focusFollowsMouse: Bool {
         self.derivedConfig.focusFollowsMouse

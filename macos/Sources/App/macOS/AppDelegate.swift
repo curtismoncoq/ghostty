@@ -131,6 +131,51 @@ class AppDelegate: NSObject,
         }
     }
 
+    private var preferredQuickTerminalController: QuickTerminalController? {
+        if let key = NSApp.keyWindow?.windowController as? QuickTerminalController,
+           key.isEffectivelyVisible {
+            return key
+        }
+
+        if let main = NSApp.mainWindow?.windowController as? QuickTerminalController,
+           main.isEffectivelyVisible {
+            return main
+        }
+
+        if let visible = QuickTerminalController.all.first(where: { $0.isEffectivelyVisible }) {
+            return visible
+        }
+
+        if let lastActive = QuickTerminalController.lastActiveController {
+            return lastActive
+        }
+
+        // Fall back to any existing quick terminal window (even if hidden) to
+        // preserve tabs across toggles.
+        return QuickTerminalController.all.first
+    }
+
+    /// Recreate the quick terminal window/controller, preserving state.
+    func recreateQuickTerminal(from controller: QuickTerminalController,
+                               animationDuration: Double,
+                               wasVisible: Bool) {
+        let state = QuickTerminalRestorableState(from: controller)
+        let oldController = controller
+
+        quickTerminalControllerState = .pendingRestore(state)
+
+        guard wasVisible else { return }
+
+        oldController.animateOut()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + animationDuration) { [weak self, oldController] in
+            guard let self else { return }
+            let newController = self.quickController
+            newController.animateIn()
+            _ = oldController
+        }
+    }
+
     /// Manages updates
     let updateController = UpdateController()
     var updateViewModel: UpdateViewModel {
@@ -1165,6 +1210,11 @@ class AppDelegate: NSObject,
     }
 
     @IBAction func toggleQuickTerminal(_ sender: Any) {
+        if let controller = preferredQuickTerminalController {
+            controller.toggle()
+            return
+        }
+
         quickController.toggle()
     }
 
